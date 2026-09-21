@@ -1,0 +1,73 @@
+# ───────── Python ─────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+ENV/
+.mypy_cache/
+.ruff_cache/
+
+# ───────── Node / 前端 ─────────
+node_modules/
+dist/
+dist-ssr/
+.vite/
+.cache/
+.parcel-cache/
+*.local
+.eslintcache
+.pnpm-store/
+
+# ───────── 敏感数据(绝不入库)─────────
+# SQLite 数据库(含真实 HIS 同步数据,464MB)
+data/drg.db
+data/drg.db-shm
+data/drg.db-wal
+data/drg.db.*
+backend/data/drg.db
+# 批量导入临时文件
+data/uploads/
+backend/data/uploads/
+# 运行日志(可能含 IP / 凭据 / 病案号)
+*.log
+data/uvicorn.log
+backend/uvicorn.log
+# 环境变量与凭据
+.env
+.env.*
+backend/.env
+backend/app/core/.env
+
+# ───────── 备份与临时文件 ─────────
+*.bak
+*.bak_*
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ───────── IDE ─────────
+.vscode/
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+
+# ───────── 任务与导出 ─────────
+batch_jobs_export/
+results_export/
+drg_results*.xlsx
+drg_results*.csv
