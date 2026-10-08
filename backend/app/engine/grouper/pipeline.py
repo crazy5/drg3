@@ -53,19 +53,30 @@ class Case:
 
 @dataclass
 class GroupResult:
-    mdc_code: str | None
-    adrg_code: str | None
-    drg_code: str | None
-    cc_level: str
-    error_type: str       # 'success' / 'fallback' / 'error'
-    error_msg: str | None
-    evidence: dict
-    duration_ms: int
+    """单病案分组结果。
+
+    这是最终对外暴露的分组产物：包含 MDC/ADRG/DRG 代码、CC 预分级、
+    运行状态（success / fallback / error）以及完整证据链，便于前端展示和排查。
+    """
+    mdc_code: str | None          # 选中的 MDC 编码；未命中时为 None
+    adrg_code: str | None          # 选中的 ADRG 编码；未命中时为 None
+    drg_code: str | None          # 最终 DRG 编码，兜底时为 0000
+    cc_level: str                  # CC/MCC 预分级结果：CC / MCC / NONE
+    error_type: str               # 'success' / 'fallback' / 'error'
+    error_msg: str | None          # fallback 或 error 的原因说明
+    evidence: dict                 # 证据快照，包含每层规则尝试细节与命中信息
+    duration_ms: int               # 单病案分组耗时（毫秒）
 
 
 def group_case(case: Case, index: RuleIndex) -> GroupResult:
-    """对单个病案执行完整分组。"""
+    """对单个病案执行完整分组。
+
+    流程遵循三层漏斗：MDC → ADRG → DRG。
+    每层都按 priority 升序尝试规则，命中第一条即返回；未命中则走 fallback。
+    同时会计算 CC 分级，并将所有尝试过的规则、短路、解释原因记录到证据链中。
+    """
     t0 = time.perf_counter()
+    # 先把病案抽象成评估视图，后续规则求值全部依赖这个统一视图，不再直接读原始对象属性。
     case_view = case.to_view()
     collector = EvidenceCollector(case_summary={
         "zyzd": case.zyzd,
@@ -76,14 +87,15 @@ def group_case(case: Case, index: RuleIndex) -> GroupResult:
     })
 
     try:
-        # ── MDC ──
+        # ── MDC：筛选主诊断分组（病案入口） ──
         mdc_stage = collector.new_stage("MDC")
+        # 按优先级顺序找首个命中的 MDC 规则；任何一层未命中都会触发 fallback
         mdc_rec = _match_first(index.mdc_rules, case_view, index, mdc_stage)
         if mdc_rec is None:
             return _fallback(collector, "no MDC matched", t0)
         collector.record_match("MDC", mdc_rec.code)
 
-        # ── ADRG ──
+        # ── ADRG：在当前 MDC 范围内继续细分 ──
         adrg_stage = collector.new_stage("ADRG")
         adrg_list = index.adrg_rules.get(mdc_rec.code, [])
         adrg_rec = _match_first(adrg_list, case_view, index, adrg_stage)
@@ -91,18 +103,20 @@ def group_case(case: Case, index: RuleIndex) -> GroupResult:
             return _fallback(collector, f"no ADRG matched in {mdc_rec.code}", t0)
         collector.record_match("ADRG", adrg_rec.code)
 
-        # ── CC 预分级 ──
+        # ── CC 预分级：DRG 规则评估时可能依赖 CC_LEVEL，因此需要先计算并注入到视图 ──
         cc_stage = collector.new_stage("CC")
-        cc_level = classify_cc(case_view, index, EvidenceNode(label="CC"))  # 单独一份证据给 CC stage
-        # 把 classify_cc 的证据挂到 cc_stage
+        # classify_cc 会返回 "MCC" / "CC" / "NONE"，并把中间证据挂在一个独立 EvidenceNode 上。
+        cc_level = classify_cc(case_view, index, EvidenceNode(label="CC"))
+        # 把 CC 结果包装成 stage 的一条伪规则，保证前端展示时看到完整的 CC 证据链
         _attach_cc_evidence(cc_stage, case_view, index, cc_level)
 
-        # DRG 规则可能引用 CC_LEVEL 变量；注入 case_view
+        # DRG 规则可能引用 CC_LEVEL 变量；注入 case_view 以保证评估时能拿到该分级
         enriched_view = case.to_view(cc_level=cc_level)
 
-        # ── DRG ──
+        # ── DRG：最终分组，可能继承 ADRG 默认规则 ──
         drg_stage = collector.new_stage("DRG")
         drg_list = index.drg_rules.get(adrg_rec.code, [])
+        # 对 DRG 层使用 empty_rule_treat="match"：空规则视作继承 ADRG 的默认命中，避免无条件规则被当作无效
         drg_rec = _match_first(drg_list, enriched_view, index, drg_stage, empty_rule_treat="match")
         if drg_rec is None:
             return _fallback(collector, f"no DRG matched in {adrg_rec.code}", t0)
@@ -120,6 +134,7 @@ def group_case(case: Case, index: RuleIndex) -> GroupResult:
             duration_ms=duration_ms,
         )
     except Exception as e:        # noqa: BLE001
+        # 任何未捕获异常都记录为 error，保持调用方可诊断且不吞异常
         log.exception("group_case failed")
         duration_ms = int((time.perf_counter() - t0) * 1000)
         return GroupResult(
@@ -141,14 +156,18 @@ def _match_first(
     stage: StageTrace,
     empty_rule_treat: str = "skip",
 ) -> RuleRecord | None:
-    """
-    按 priority 顺序遍历，第一个命中即返回。
+    """按 priority 顺序遍历，返回第一个命中的规则。
+
+    这是三层漏斗的核心：MDC/ADRG/DRG 每层都复用同一逻辑，
+    保证较低 priority 的规则在相同层级中优先级更高，且能保留完整证据树。
+
     empty_rule_treat:
-      - "skip"  MDC/ADRG 层：空规则视为占位，跳过
+      - "skip"  MDC/ADRG 层：空规则视为占位，跳过，不作为命中
       - "match" DRG 层：空规则视为该 ADRG 的默认子组，直接命中
     """
     for rule in rules:
-        # parse 失败的规则（DSL 不支持）直接跳过，绝不能 silent 命中
+        # parse 失败的规则（DSL 不支持）直接跳过，绝不能 silent 命中；
+        # 否则历史上曾出现“规则解析失败但被当成恒真”，导致大量病案被误吸入错误分组。
         if rule.is_invalid or rule.ast is None:
             ev_node = EvidenceNode(label=f"rule.{rule.code}")
             ev_node.set(kind="invalid", note="DSL 解析失败，规则被跳过（防 silent 命中）")
@@ -161,6 +180,8 @@ def _match_first(
             )
             continue
 
+        # 空规则代表“无独立条件”，通常用于继承父节点逻辑；
+        # 但不同层级的语义不同：MDC/ADRG 允许跳过，而 DRG 可作为默认命中。
         if not rule.raw_expr or not rule.raw_expr.strip():
             if empty_rule_treat == "match":
                 # DRG 层：空规则直接命中（继承 ADRG），记录恒真证据
@@ -173,11 +194,13 @@ def _match_first(
                     children=ev_node,
                 )
                 return rule
-            # skip：占位，跳过
+            # skip：占位，跳过，继续找下一个更具体的条件规则
             continue
 
         ev_node = EvidenceNode(label=f"rule.{rule.code}")
         try:
+            # 真正的规则求值在这里：把 AST 与病案视图一起计算，
+            # 产生布尔值并附带中间节点证据（如条件分支、集合判定、字段访问）。
             matched = evaluate(rule.ast, case_view, index, ev_node)
         except Exception as e:        # noqa: BLE001
             stage.add_tried(
@@ -214,8 +237,12 @@ def _attach_cc_evidence(
     index: RuleIndex,
     cc_level: str,
 ) -> None:
-    """把 classify_cc 的结果作为一条"伪规则"挂到 stage 里（便于前端展示）。"""
-    # 直接重新跑一遍拿证据（开销可忽略）
+    """把 classify_cc 的结果作为一条“伪规则”挂到 stage 里（便于前端展示）。
+
+    这是为了让 CC 分级也像真实规则一样参与证据链：
+    前端能在同一页里看到“CC 规则尝试了什么、命中/未命中、排除表过滤细节”。
+    """
+    # 直接重新跑一遍拿证据，成本很低；这样可以在 stage 内保留完整的中间过程。
     ev = EvidenceNode(label="CC.classify")
     classify_cc(case_view, index, ev)
     stage.add_tried(
@@ -228,6 +255,12 @@ def _attach_cc_evidence(
 
 
 def _fallback(collector: EvidenceCollector, reason: str, t0: float) -> GroupResult:
+    """兜底返回值，表示某一层没有命中规则。
+
+    规则：
+    - MDC/ADRG/DRG 任意一层未命中 → drg_code='0000'
+    - 统一返回 fallback 状态，以便上层感知并记录问题原因
+    """
     duration_ms = int((time.perf_counter() - t0) * 1000)
     return GroupResult(
         mdc_code=None,
