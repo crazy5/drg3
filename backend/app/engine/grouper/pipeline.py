@@ -150,10 +150,15 @@ def group_case(case: Case, index: RuleIndex) -> GroupResult:
 
 
 def _match_first(
+    # 匹配第一个命中的规则
     rules: list[RuleRecord],
+    # 病案视图，规则求值时的上下文
     case_view: CaseView,
+    # 规则索引，包含 CC/MCC 集合、排除表、MDC/ADRG/DRG 规则等
     index: RuleIndex,
+    # 当前阶段的证据采集器，用于记录每条规则尝试的结果
     stage: StageTrace,
+    # 空规则的处理方式：MDC/ADRG 层跳过，DRG 层视为默认命中
     empty_rule_treat: str = "skip",
 ) -> RuleRecord | None:
     """按 priority 顺序遍历，返回第一个命中的规则。
@@ -169,8 +174,11 @@ def _match_first(
         # parse 失败的规则（DSL 不支持）直接跳过，绝不能 silent 命中；
         # 否则历史上曾出现“规则解析失败但被当成恒真”，导致大量病案被误吸入错误分组。
         if rule.is_invalid or rule.ast is None:
+            # 记录一条无效规则尝试，标记为 skipped，并附上原因
             ev_node = EvidenceNode(label=f"rule.{rule.code}")
+            # 记录无效规则的证据节点，标记为 invalid，并附上 note 说明 DSL 解析失败
             ev_node.set(kind="invalid", note="DSL 解析失败，规则被跳过（防 silent 命中）")
+            # 记录到 stage 的 tried_rules 中，标记为 skipped，并附上 skip_reason
             stage.add_tried(
                 rule_code=rule.code,
                 raw_expr=rule.raw_expr,
@@ -201,6 +209,7 @@ def _match_first(
         try:
             # 真正的规则求值在这里：把 AST 与病案视图一起计算，
             # 产生布尔值并附带中间节点证据（如条件分支、集合判定、字段访问）。
+            # 如果规则求值出错，则记录一条失败的尝试，并附上异常信息，继续尝试下一个规则。
             matched = evaluate(rule.ast, case_view, index, ev_node)
         except Exception as e:        # noqa: BLE001
             stage.add_tried(

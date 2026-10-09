@@ -78,7 +78,7 @@ class CaseView:
             return self._fields[alias]
         return None
 
-
+# 将任意值转换为数字（int / float），用于比较运算。None 或空字符串视作无法比较。
 def _to_number(v: Any) -> int | float | None:
     if v is None or v == "":
         return None
@@ -91,7 +91,7 @@ def _to_number(v: Any) -> int | float | None:
     except (ValueError, TypeError):
         return None
 
-
+# 比较运算：支持 =, >=, <=, >, <。None 视作不满足。
 def _compare(actual: Any, op: str, expected: Any) -> bool:
     """比较运算。None 视作不满足。"""
     a = _to_number(actual)
@@ -117,20 +117,27 @@ def evaluate(
     ctx: Any,            # RuleIndex（鸭子类型，避免循环 import）
     ev: EvidenceNode,
 ) -> bool:
+    # 逻辑 OR：先求左子树；只要左侧为 True，则右侧无需计算，记录为短路跳过。
     if isinstance(node, OrNode):
+        # 取左子树证据节点
         left_ev = ev.child("or.left")
+        # 递归求值左子树
         left_val = evaluate(node.left, case, ctx, left_ev)
         if left_val:
             # 左侧命中 → 右侧标记未求值（短路证据）
             right_ev = ev.child("or.right")
+            # 右侧标记为短路跳过，附上原因
             right_ev.set(skipped_short_circuit=True, reason="or.left was True")
+            # 设置当前节点为 OR，结果为 True
             ev.set(node="Or", result=True)
             return True
         right_ev = ev.child("or.right")
         right_val = evaluate(node.right, case, ctx, right_ev)
+        # 设置当前节点为 OR，结果为右侧的求值结果
         ev.set(node="Or", result=right_val)
         return right_val
 
+    # 逻辑 AND：先求左子树；只要左侧为 False，则右侧无需计算，记录为短路跳过。
     if isinstance(node, AndNode):
         left_ev = ev.child("and.left")
         left_val = evaluate(node.left, case, ctx, left_ev)
@@ -144,15 +151,18 @@ def evaluate(
         ev.set(node="And", result=right_val)
         return right_val
 
+    # 逻辑 NOT：对内部表达式取反，并把证据链继续挂在子节点上。
     if isinstance(node, NotNode):
         inner_ev = ev.child("not")
         v = evaluate(node.operand, case, ctx, inner_ev)
         ev.set(node="Not", result=not v)
         return not v
 
+    # 集合/成员判定：例如变量是否在某个规则集合中，支持单集合/多集合/多字段。
     if isinstance(node, InCheckNode):
         return _eval_in(node, case, ctx, ev)
 
+    # 比较表达式：从 case 中取变量值，并与目标值按操作符比较。
     if isinstance(node, CompareNode):
         actual = getattr(case, node.variable, None)
         result = _compare(actual, node.op, node.value)
@@ -166,13 +176,16 @@ def evaluate(
         )
         return result
 
+    # 长度比较：用于检查列表长度或字符串长度等与阈值的关系。
     if isinstance(node, LengthCompareNode):
         return _eval_length(node, case, ctx, ev)
 
+    # 常量 True：规则中直接写 True 的兜底叶子节点。
     if isinstance(node, ConstTrueNode):
         ev.set(node="True", result=True)
         return True
 
+    # 未知节点类型：说明 AST 与解释器版本不一致，通常应视为实现错误。
     raise TypeError(f"cannot evaluate node: {type(node).__name__}")
 
 
