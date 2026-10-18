@@ -16,6 +16,9 @@ env/
 ENV/
 .mypy_cache/
 .ruff_cache/
+.codegraph/
+.gitnexus/
+.omo/
 
 # ───────── Node / 前端 ─────────
 node_modules/
